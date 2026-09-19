@@ -51,6 +51,25 @@ describe("server environment validation", () => {
     }),
   );
 
+  it.effect("flags a present-but-empty value as invalid, matching live config", () =>
+    Effect.gen(function* () {
+      const error = yield* runValidation({ T3CODE_PORT: "" }).pipe(Effect.flip);
+      const row = rowFor(error.rows, "T3CODE_PORT");
+      assert.ok(row);
+      assert.strictEqual(row.status, "invalid");
+    }),
+  );
+
+  it.effect("flags an unknown log level literal, matching live config", () =>
+    Effect.gen(function* () {
+      const error = yield* runValidation({ T3CODE_LOG_LEVEL: "Verbose" }).pipe(Effect.flip);
+      const row = rowFor(error.rows, "T3CODE_LOG_LEVEL");
+      assert.ok(row);
+      assert.strictEqual(row.status, "invalid");
+      assert.include(row.expected, "Warn");
+    }),
+  );
+
   it.effect("flags an invalid T3CODE_MODE literal", () =>
     Effect.gen(function* () {
       const error = yield* runValidation({ T3CODE_MODE: "space-shuttle" }).pipe(Effect.flip);
@@ -92,6 +111,7 @@ describe("server environment validation", () => {
         T3CODE_PORT: "3773",
         T3CODE_HOST: "127.0.0.1",
         T3CODE_LOG_LEVEL: "Debug",
+        T3CODE_NO_BROWSER: "1",
       });
       assert.equal(rows.filter((row) => row.status !== "ok").length, 0);
       const port = rowFor(rows, "T3CODE_PORT");

@@ -30,8 +30,6 @@ export const startCommand = Command.make("start", { ...sharedServerCommandFlags 
   Command.withHandler((flags) => runServerCommand(flags)),
 );
 
-export const validateConfigCommand = validateConfigCommand;
-
 export const serveCommand = Command.make("serve", { ...sharedServerCommandFlags }).pipe(
   Command.withDescription(
     "Run the T3 Code server without opening a browser and print headless pairing details.",

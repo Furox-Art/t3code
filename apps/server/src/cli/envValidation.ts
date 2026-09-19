@@ -52,21 +52,68 @@ export class ServerEnvValidationError extends Schema.TaggedError<ServerEnvValida
   }
 }
 
+/**
+ * Accepts exactly the values Effect's own `Config.Boolean` accepts
+ * (`Schema.BooleanLiterals`): true/yes/on/1/y and false/no/off/0/n.
+ */
 const BooleanFromString = Schema.String.pipe(
   Schema.decodeTo(
     Schema.Boolean,
     SchemaTransformation.transformEffect({
-      decode: (value: string) =>
-        value === "true"
-          ? Effect.succeed(true)
-          : value === "false"
-            ? Effect.succeed(false)
-            : Effect.fail(
-                new SchemaIssue.InvalidValue({
-                  message: `expected "true" or "false", received "${value}"`,
-                }),
-              ),
+      decode: (value: string) => {
+        switch (value) {
+          case "true":
+          case "yes":
+          case "on":
+          case "1":
+          case "y":
+            return Effect.succeed(true);
+          case "false":
+          case "no":
+          case "off":
+          case "0":
+          case "n":
+            return Effect.succeed(false);
+          default:
+            return Effect.fail(
+              new SchemaIssue.InvalidValue({
+                message: `expected a boolean flag (true/yes/on/1/y or false/no/off/0/n), received "${value}"`,
+              }),
+            );
+        }
+      },
       encode: (value: boolean) => Effect.succeed(value ? "true" : "false"),
+    }),
+  ),
+);
+
+/**
+ * Accepts exactly the literals Effect's own `Config.LogLevel` accepts
+ * (`Schema.Literals(LogLevel.values)`).
+ */
+const LOG_LEVEL_VALUES = [
+  "All",
+  "Fatal",
+  "Error",
+  "Warn",
+  "Info",
+  "Debug",
+  "Trace",
+  "None",
+] as const;
+const LogLevelFromString = Schema.String.pipe(
+  Schema.decodeTo(
+    Schema.Literals(LOG_LEVEL_VALUES),
+    SchemaTransformation.transformEffect({
+      decode: (value: string) =>
+        (LOG_LEVEL_VALUES as readonly string[]).includes(value)
+          ? Effect.succeed(value as (typeof LOG_LEVEL_VALUES)[number])
+          : Effect.fail(
+              new SchemaIssue.InvalidValue({
+                message: `expected one of ${LOG_LEVEL_VALUES.join(", ")}, received "${value}"`,
+              }),
+            ),
+      encode: (value: (typeof LOG_LEVEL_VALUES)[number]) => Effect.succeed(value),
     }),
   ),
 );
@@ -154,14 +201,17 @@ const stringSpec = (
 });
 
 export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
-  stringSpec("T3CODE_LOG_LEVEL", "log level (e.g. Error, Info, Debug)", "Server log verbosity.", {
-    defaultText: "Info",
-  }),
+  stringSpec(
+    "T3CODE_LOG_LEVEL",
+    "log level (All, Fatal, Error, Warn, Info, Debug, Trace, None)",
+    "Server log verbosity.",
+    { schema: LogLevelFromString, defaultText: "Info" },
+  ),
   stringSpec(
     "T3CODE_TRACE_MIN_LEVEL",
-    "log level (e.g. Error, Info, Debug)",
+    "log level (All, Fatal, Error, Warn, Info, Debug, Trace, None)",
     "Minimum level for trace output.",
-    { defaultText: "Info" },
+    { schema: LogLevelFromString, defaultText: "Info" },
   ),
   stringSpec("T3CODE_TRACE_TIMING_ENABLED", "boolean", "Include timing data in traces.", {
     schema: BooleanFromString,
@@ -343,7 +393,9 @@ export const formatEnvValidationTable = (rows: ReadonlyArray<ServerEnvVariableRo
     }
     return width;
   });
-  const rule = `+-${widths.map((width) => "-".repeat(width)).join("-+--")}-+`;
+  // Row cells join with " | " (3 chars), so rule boundaries join with "-+-"
+  // to keep the '+' centered under each '|'.
+  const rule = `+-${widths.map((width) => "-".repeat(width)).join("-+-")}-+`;
   const formatLine = (cells: readonly string[]) =>
     `| ${cells.map((cell, index) => cell.padEnd(widths[index] ?? cell.length)).join(" | ")} |`;
 
@@ -383,7 +435,9 @@ export const validateServerEnvironment = Effect.gen(function* () {
   for (const spec of serverEnvSpecs) {
     const raw = env[spec.variable];
     const value = typeof raw === "string" ? raw : undefined;
-    if (value === undefined || value.trim().length === 0) {
+    // A present-but-empty value must reach schema validation, matching live
+    // config behavior where `T3CODE_PORT=` is invalid rather than defaulted.
+    if (value === undefined || (spec.required && value.trim().length === 0)) {
       rows.push({
         variable: spec.variable,
         expected: spec.expected,
