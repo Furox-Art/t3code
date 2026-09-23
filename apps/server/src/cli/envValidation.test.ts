@@ -1,192 +1,239 @@
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NetService from "@t3tools/shared/Net";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as TestConsole from "effect/testing/TestConsole";
+import { Command, GlobalFlag } from "effect/unstable/cli";
+import * as CliError from "effect/unstable/cli/CliError";
 
-import { formatEnvValidationTable, validateServerEnvironment } from "./envValidation.ts";
+import { makeCli } from "../bin.ts";
+import { type CliServerFlags, serverEnvSpecs } from "./config.ts";
+import {
+  type ServerEnvVariableRow,
+  ServerEnvValidationError,
+  runServerEnvironmentValidation,
+  validateServerEnvironment,
+} from "./envValidation.ts";
+import { runServerCommand } from "./server.ts";
+
+const configLayer = (env: Record<string, string>) =>
+  ConfigProvider.layer(ConfigProvider.fromEnv({ env }));
 
 const runValidation = (env: Record<string, string>) =>
-  validateServerEnvironment.pipe(Effect.provide(Layer.succeed(HostProcessEnvironment, env)));
+  validateServerEnvironment.pipe(Effect.provide(configLayer(env)));
 
-const rowFor = <Row extends { variable: string }>(
-  rows: ReadonlyArray<Row>,
+const rowFor = (
+  rows: ReadonlyArray<ServerEnvVariableRow>,
   variable: string,
-): Row | undefined => rows.find((row) => row.variable === variable);
+): ServerEnvVariableRow | undefined => rows.find((row) => row.variable === variable);
+
+const expectUserError = (error: unknown): CliError.UserError => {
+  if (!Schema.is(CliError.UserError)(error)) {
+    throw new Error("Expected UserError");
+  }
+  return error;
+};
+
+const expectValidationError = (error: unknown): ServerEnvValidationError => {
+  if (!Schema.is(ServerEnvValidationError)(error)) {
+    throw new Error("Expected ServerEnvValidationError");
+  }
+  return error;
+};
+
+const serverFlags = (validateConfig = false): CliServerFlags => ({
+  validateConfig: Option.some(validateConfig),
+  mode: Option.none(),
+  port: Option.none(),
+  host: Option.none(),
+  baseDir: Option.none(),
+  cwd: Option.none(),
+  devUrl: Option.none(),
+  noBrowser: Option.none(),
+  bootstrapFd: Option.none(),
+  autoBootstrapProjectFromCwd: Option.none(),
+  logWebSocketEvents: Option.none(),
+  tailscaleServeEnabled: Option.none(),
+  tailscaleServePort: Option.none(),
+});
+
+const runValidationFlag = (args: ReadonlyArray<string>, env: Record<string, string>) =>
+  Command.runWith(makeCli({ cloudEnabled: false }), { version: "0.0.0" })(args).pipe(
+    Effect.provide(
+      Layer.mergeAll(NodeServices.layer, NetService.layer, configLayer(env), TestConsole.layer),
+    ),
+  );
 
 describe("server environment validation", () => {
-  it.effect("documents defaults for every optional variable on a clean environment", () =>
+  it.effect("prints every optional and default row on success", () =>
     Effect.gen(function* () {
-      const rows = yield* runValidation({});
-      assert.ok(rows.length >= 20, `expected many rows, got ${rows.length}`);
-      assert.equal(rows.filter((row) => row.status === "invalid").length, 0);
-      assert.equal(rows.filter((row) => row.status === "missing").length, 0);
-      const port = rowFor(rows, "T3CODE_PORT");
-      assert.ok(port);
-      assert.include(port.received ?? "", "(unset)");
-      const protocol = rowFor(rows, "T3CODE_OTLP_PROTOCOL");
-      assert.ok(protocol);
-      assert.include(protocol.received ?? "", "(default: http/json)");
+      yield* runServerEnvironmentValidation.pipe(
+        Effect.provide(Layer.mergeAll(configLayer({}), TestConsole.layer)),
+      );
+      const output = (yield* TestConsole.logLines)
+        .filter((line): line is string => typeof line === "string")
+        .join("\n");
+
+      assert.include(output, "Server environment validation succeeded:");
+      assert.include(output, "T3CODE_OTLP_PROTOCOL");
+      assert.include(output, "(default: http/json)");
+      assert.include(output, "T3CODE_PORT");
+      assert.include(output, "(unset)");
+      for (const spec of serverEnvSpecs) {
+        assert.include(output, spec.variable);
+      }
     }),
   );
 
-  it.effect("flags an invalid T3CODE_PORT with the received value", () =>
+  it.effect("prints defaults alongside failures", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_PORT: "not-a-port" }).pipe(Effect.flip);
-      assert.strictEqual(error._tag, "ServerEnvValidationError");
-      const row = rowFor(error.rows, "T3CODE_PORT");
-      assert.ok(row, "expected a T3CODE_PORT failure row");
-      assert.strictEqual(row.status, "invalid");
-      assert.include(row.received ?? "", "not-a-port");
-      assert.include(row.expected, "1-65535");
+      const error = yield* runServerEnvironmentValidation.pipe(
+        Effect.provide(configLayer({ T3CODE_PORT: "70000" })),
+        Effect.flip,
+      );
+
+      const userError = expectUserError(error);
+      assert.include(userError.userMessage ?? "", "Server environment validation failed:");
+      assert.include(userError.userMessage ?? "", "T3CODE_PORT");
+      assert.include(userError.userMessage ?? "", "INVALID");
+      assert.include(userError.userMessage ?? "", "(default: http/json)");
+      assert.include(userError.userMessage ?? "", "(unset)");
     }),
   );
 
-  it.effect("flags an out-of-range port", () =>
+  it.effect("rejects invalid startup before config resolution or service initialization", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_PORT: "99999" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_PORT");
-      assert.ok(row);
-      assert.strictEqual(row.status, "invalid");
+      const error = yield* runServerCommand(serverFlags()).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            NetService.layer,
+            Layer.succeed(GlobalFlag.LogLevel, Option.none()),
+            configLayer({ T3CODE_PORT: "not-a-port" }),
+          ),
+        ),
+        Effect.flip,
+      );
+
+      const userError = expectUserError(error);
+      assert.include(userError.userMessage ?? "", "T3CODE_PORT");
+      assert.include(userError.userMessage ?? "", "not-a-port");
     }),
   );
 
-  it.effect("flags a present-but-empty value as invalid, matching live config", () =>
+  it.effect("keeps --validate-config exit behavior identical on root, start, and serve", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_PORT: "" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_PORT");
-      assert.ok(row);
-      assert.strictEqual(row.status, "invalid");
+      for (const args of [
+        ["--validate-config"],
+        ["start", "--validate-config"],
+        ["serve", "--validate-config"],
+      ]) {
+        const result = yield* runValidationFlag(args, {}).pipe(Effect.exit);
+        assert.isTrue(Exit.isSuccess(result));
+      }
+
+      for (const args of [
+        ["--validate-config"],
+        ["start", "--validate-config"],
+        ["serve", "--validate-config"],
+      ]) {
+        const error = yield* runValidationFlag(args, { T3CODE_MODE: "invalid" }).pipe(Effect.flip);
+        expectUserError(error);
+      }
     }),
   );
 
-  it.effect("flags an unknown log level literal, matching live config", () =>
+  it.effect("rejects values through the same Config decoders used by startup", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_LOG_LEVEL: "Verbose" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_LOG_LEVEL");
-      assert.ok(row);
-      assert.strictEqual(row.status, "invalid");
-      assert.include(row.expected, "Warn");
-    }),
-  );
-
-  it.effect("flags an invalid T3CODE_MODE literal", () =>
-    Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_MODE: "space-shuttle" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_MODE");
-      assert.ok(row, "expected a T3CODE_MODE failure row");
-      assert.strictEqual(row.status, "invalid");
-      assert.strictEqual(row.expected, "web | desktop");
-    }),
-  );
-
-  it.effect("flags a malformed OTLP traces URL", () =>
-    Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_OTLP_TRACES_URL: "not a url" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_OTLP_TRACES_URL");
-      assert.ok(row);
-      assert.strictEqual(row.status, "invalid");
-    }),
-  );
-
-  it.effect("flags an invalid boolean and an invalid integer", () =>
-    Effect.gen(function* () {
-      const error = yield* runValidation({
+      const validationError = yield* runValidation({
+        T3CODE_LOG_LEVEL: "Verbose",
+        T3CODE_MODE: "space-shuttle",
         T3CODE_NO_BROWSER: "maybe",
+        T3CODE_OTLP_TRACES_URL: "not a url",
+        T3CODE_PORT: "70000",
         T3CODE_TRACE_MAX_FILES: "ten",
       }).pipe(Effect.flip);
+      const error = expectValidationError(validationError);
+      const port = rowFor(error.rows, "T3CODE_PORT");
+      const logLevel = rowFor(error.rows, "T3CODE_LOG_LEVEL");
+      const mode = rowFor(error.rows, "T3CODE_MODE");
       const noBrowser = rowFor(error.rows, "T3CODE_NO_BROWSER");
-      assert.ok(noBrowser);
-      assert.strictEqual(noBrowser.status, "invalid");
-      const traceMaxFiles = rowFor(error.rows, "T3CODE_TRACE_MAX_FILES");
-      assert.ok(traceMaxFiles);
-      assert.strictEqual(traceMaxFiles.status, "invalid");
+      const tracesUrl = rowFor(error.rows, "T3CODE_OTLP_TRACES_URL");
+      const maxFiles = rowFor(error.rows, "T3CODE_TRACE_MAX_FILES");
+
+      assert.strictEqual(error._tag, "ServerEnvValidationError");
+      assert.equal(error.rows.length, serverEnvSpecs.length);
+      assert.strictEqual(port?.status, "invalid");
+      assert.strictEqual(logLevel?.status, "invalid");
+      assert.strictEqual(mode?.status, "invalid");
+      assert.strictEqual(noBrowser?.status, "invalid");
+      assert.strictEqual(tracesUrl?.status, "invalid");
+      assert.strictEqual(maxFiles?.status, "invalid");
     }),
   );
 
-  it.effect("accepts valid web mode settings with received values", () =>
+  it.effect("matches ConfigProvider handling of present empty values", () =>
+    Effect.gen(function* () {
+      const rows = yield* runValidation({ T3CODE_PORT: "" });
+      const port = rowFor(rows, "T3CODE_PORT");
+
+      assert.strictEqual(port?.status, "ok");
+      assert.strictEqual(port?.received, "(unset)");
+    }),
+  );
+
+  it.effect("accepts the canonical boolean and log-level literals", () =>
     Effect.gen(function* () {
       const rows = yield* runValidation({
-        T3CODE_MODE: "web",
-        T3CODE_PORT: "3773",
-        T3CODE_HOST: "127.0.0.1",
         T3CODE_LOG_LEVEL: "Debug",
-        T3CODE_NO_BROWSER: "1",
+        T3CODE_NO_BROWSER: "yes",
+        T3CODE_TRACE_TIMING_ENABLED: "0",
       });
+
       assert.equal(rows.filter((row) => row.status !== "ok").length, 0);
-      const port = rowFor(rows, "T3CODE_PORT");
-      assert.ok(port);
-      assert.strictEqual(port.received, "3773");
     }),
   );
 
-  it.effect("flags a too-short dev auth token as invalid", () =>
+  it.effect("redacts complete secret values from failure output", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_DEV_AUTH_TOKEN: "short" }).pipe(Effect.flip);
-      const row = rowFor(error.rows, "T3CODE_DEV_AUTH_TOKEN");
-      assert.ok(row, "expected a T3CODE_DEV_AUTH_TOKEN failure row");
-      assert.strictEqual(row.status, "invalid");
-      assert.include(row.expected, "32");
-    }),
-  );
-
-  it.effect("redacts secret-looking variables in the received column", () =>
-    Effect.gen(function* () {
-      const error = yield* runValidation({
-        T3CODE_DEV_AUTH_TOKEN: "short",
-        // Valid pairs plus one malformed pair -> row surfaces as invalid, and
-        // the raw secret-bearing value must never reach the rendered table.
-        T3CODE_OTLP_HEADERS: "authorization=super-secret-value, bad-pair-no-equals",
-      }).pipe(Effect.flip);
-      const tokenRow = rowFor(error.rows, "T3CODE_DEV_AUTH_TOKEN");
-      assert.ok(tokenRow);
-      assert.ok((tokenRow.received ?? "").includes("<redacted>"));
-      assert.ok(!(tokenRow.received ?? "").includes("short"));
-      const headersRow = rowFor(error.rows, "T3CODE_OTLP_HEADERS");
-      assert.ok(headersRow);
-      assert.ok(!(headersRow.received ?? "").includes("super-secret-value"));
-    }),
-  );
-
-  it.effect("renders a table with header, rule and status lines for failures", () =>
-    Effect.gen(function* () {
-      const error = yield* runValidation({ T3CODE_PORT: "70000" }).pipe(Effect.flip);
-      const table = formatEnvValidationTable(
-        error.rows.map((row) => ({ ...row, received: row.received ?? "" })),
+      const devToken = "short-development-secret";
+      const headerSecret = "super-secret-header-value";
+      const error = yield* runServerEnvironmentValidation.pipe(
+        Effect.provide(
+          configLayer({
+            T3CODE_DEV_AUTH_TOKEN: devToken,
+            T3CODE_OTLP_HEADERS: `authorization=${headerSecret}, malformed`,
+          }),
+        ),
+        Effect.flip,
       );
-      assert.include(table, "VARIABLE");
-      assert.include(table, "STATUS");
-      assert.include(table, "EXPECTED");
-      assert.include(table, "RECEIVED");
-      assert.include(table, "DESCRIPTION");
-      assert.include(table, "T3CODE_PORT");
-      assert.include(table, "INVALID");
-      assert.include(table, "+--");
+
+      const userError = expectUserError(error);
+      assert.notInclude(userError.userMessage ?? "", devToken);
+      assert.notInclude(userError.userMessage ?? "", headerSecret);
+      assert.include(userError.userMessage ?? "", "T3CODE_DEV_AUTH_TOKEN");
+      assert.include(userError.userMessage ?? "", "T3CODE_OTLP_HEADERS");
+      assert.include(userError.userMessage ?? "", "<redacted>");
     }),
   );
 
-  it.effect("validation error carries only failing rows and a summary", () =>
+  it.effect("returns every row and the failure summary", () =>
     Effect.gen(function* () {
-      const error = yield* runValidation({
+      const validationError = yield* runValidation({
         T3CODE_MODE: "nope",
         T3CODE_PORT: "abc",
       }).pipe(Effect.flip);
+      const error = expectValidationError(validationError);
+
       assert.strictEqual(error._tag, "ServerEnvValidationError");
-      assert.equal(error.rows.length, 2);
-      assert.ok(error.rows.every((row) => row.status === "missing" || row.status === "invalid"));
+      assert.equal(error.rows.length, serverEnvSpecs.length);
       assert.include(error.summary, "0 missing");
       assert.include(error.summary, "2 invalid");
-    }),
-  );
-
-  it.effect("success path exits cleanly, failure path exits non-zero", () =>
-    Effect.gen(function* () {
-      const ok = Exit.isFailure(yield* Effect.exit(runValidation({})));
-      assert.equal(ok, false);
-      const failed = Exit.isFailure(
-        yield* Effect.exit(runValidation({ T3CODE_PORT: "not-a-port" })),
-      );
-      assert.equal(failed, true);
     }),
   );
 });

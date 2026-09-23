@@ -5,6 +5,7 @@ import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as LogLevel from "effect/LogLevel";
 import * as Option from "effect/Option";
@@ -83,7 +84,44 @@ const validateConfigFlag = Flag.Boolean("validate-config").pipe(
   Flag.optional,
 );
 
-const EnvServerConfig = Config.all({
+const ValidUrlStringFromString = Schema.String.pipe(
+  Schema.decodeTo(
+    Schema.String,
+    SchemaTransformation.transformEffect({
+      decode: (value) =>
+        Exit.isSuccess(Schema.decodeExit(Schema.URLFromString)(value))
+          ? Effect.succeed(value)
+          : Effect.fail(
+              new SchemaIssue.InvalidValue({
+                message: `expected a valid URL, received "${value}"`,
+              }),
+            ),
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
+
+const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
+  Config.map((token) => Redacted.make(Redacted.value(token).trim())),
+  Config.mapEffect((token) =>
+    Redacted.value(token).length === 0 || Redacted.value(token).length >= 32
+      ? Effect.succeed(token)
+      : Effect.fail(
+          new Config.ConfigError(
+            new Schema.SchemaError(
+              new SchemaIssue.InvalidValue({
+                message: "T3CODE_DEV_AUTH_TOKEN must contain at least 32 characters.",
+              }),
+            ),
+          ),
+        ),
+  ),
+  Config.option,
+  Config.map(Option.filter((token) => Redacted.value(token).length > 0)),
+  Config.map(Option.getOrUndefined),
+);
+
+const serverEnvironmentConfig = {
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
@@ -94,15 +132,15 @@ const EnvServerConfig = Config.all({
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: Config.Int("T3CODE_TRACE_MAX_FILES").pipe(Config.withDefault(10)),
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
-  otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
+  otlpTracesUrl: Config.schema(ValidUrlStringFromString, "T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
-  otlpMetricsUrl: Config.String("T3CODE_OTLP_METRICS_URL").pipe(
+  otlpMetricsUrl: Config.schema(ValidUrlStringFromString, "T3CODE_OTLP_METRICS_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
-  otlpLogsUrl: Config.String("T3CODE_OTLP_LOGS_URL").pipe(
+  otlpLogsUrl: Config.schema(ValidUrlStringFromString, "T3CODE_OTLP_LOGS_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
@@ -158,27 +196,215 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+} as const;
+
+const EnvServerConfig = Config.all(serverEnvironmentConfig);
+
+export interface ServerEnvVarSpec {
+  readonly variable: string;
+  readonly expected: string;
+  readonly description: string;
+  readonly config: Config.Config<unknown>;
+  readonly required: boolean;
+  readonly secret: boolean;
+  readonly defaultText: string | undefined;
+}
+
+const envSpec = <Value>(
+  variable: string,
+  expected: string,
+  description: string,
+  config: Config.Config<Value>,
+  options: Partial<Omit<ServerEnvVarSpec, "variable" | "expected" | "description" | "config">> = {},
+): ServerEnvVarSpec => ({
+  variable,
+  expected,
+  description,
+  config,
+  required: false,
+  secret: false,
+  defaultText: undefined,
+  ...options,
 });
 
-const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
-  Config.map((token) => Redacted.make(Redacted.value(token).trim())),
-  Config.mapEffect((token) =>
-    Redacted.value(token).length === 0 || Redacted.value(token).length >= 32
-      ? Effect.succeed(token)
-      : Effect.fail(
-          new Config.ConfigError(
-            new Schema.SchemaError(
-              new SchemaIssue.InvalidValue({
-                message: "T3CODE_DEV_AUTH_TOKEN must contain at least 32 characters.",
-              }),
-            ),
-          ),
-        ),
+export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
+  envSpec(
+    "T3CODE_LOG_LEVEL",
+    "log level (All, Fatal, Error, Warn, Info, Debug, Trace, None)",
+    "Server log verbosity.",
+    serverEnvironmentConfig.logLevel,
+    { defaultText: "Info" },
   ),
-  Config.option,
-  Config.map(Option.filter((token) => Redacted.value(token).length > 0)),
-  Config.map(Option.getOrUndefined),
-);
+  envSpec(
+    "T3CODE_TRACE_MIN_LEVEL",
+    "log level (All, Fatal, Error, Warn, Info, Debug, Trace, None)",
+    "Minimum level for trace output.",
+    serverEnvironmentConfig.traceMinLevel,
+    { defaultText: "Info" },
+  ),
+  envSpec(
+    "T3CODE_TRACE_TIMING_ENABLED",
+    "boolean",
+    "Include timing data in traces.",
+    serverEnvironmentConfig.traceTimingEnabled,
+    { defaultText: "true" },
+  ),
+  envSpec(
+    "T3CODE_TRACE_MAX_BYTES",
+    "integer (bytes)",
+    "Maximum trace file size before rotation.",
+    serverEnvironmentConfig.traceMaxBytes,
+    { defaultText: "10485760" },
+  ),
+  envSpec(
+    "T3CODE_TRACE_MAX_FILES",
+    "integer",
+    "Number of rotated trace files to keep.",
+    serverEnvironmentConfig.traceMaxFiles,
+    { defaultText: "10" },
+  ),
+  envSpec(
+    "T3CODE_TRACE_BATCH_WINDOW_MS",
+    "integer (milliseconds)",
+    "Window for batching trace events.",
+    serverEnvironmentConfig.traceBatchWindowMs,
+    { defaultText: "1000" },
+  ),
+  envSpec(
+    "T3CODE_TRACE_FILE",
+    "file path",
+    "Explicit trace output file; defaults to the server log directory.",
+    serverEnvironmentConfig.traceFile,
+  ),
+  envSpec(
+    "T3CODE_OTLP_TRACES_URL",
+    "URL",
+    "OTLP endpoint for trace export.",
+    serverEnvironmentConfig.otlpTracesUrl,
+  ),
+  envSpec(
+    "T3CODE_OTLP_METRICS_URL",
+    "URL",
+    "OTLP endpoint for metrics export.",
+    serverEnvironmentConfig.otlpMetricsUrl,
+  ),
+  envSpec(
+    "T3CODE_OTLP_LOGS_URL",
+    "URL",
+    "OTLP endpoint for log export.",
+    serverEnvironmentConfig.otlpLogsUrl,
+  ),
+  envSpec(
+    "T3CODE_OTLP_EXPORT_INTERVAL_MS",
+    "integer (milliseconds)",
+    "OTLP export interval.",
+    serverEnvironmentConfig.otlpExportIntervalMs,
+    { defaultText: "10000" },
+  ),
+  envSpec(
+    "T3CODE_OTLP_SERVICE_NAME",
+    "string",
+    "Service name attached to OTLP resources.",
+    serverEnvironmentConfig.otlpServiceName,
+    { defaultText: "t3-server" },
+  ),
+  envSpec(
+    "T3CODE_OTLP_HEADERS",
+    "comma-separated key=value pairs",
+    "Headers attached to OTLP export requests. Values are redacted in this table.",
+    serverEnvironmentConfig.otlpHeaders,
+    { secret: true },
+  ),
+  envSpec(
+    "T3CODE_OTLP_PROTOCOL",
+    "http/json | http/protobuf",
+    "Wire protocol for OTLP exporters.",
+    serverEnvironmentConfig.otlpProtocol,
+    { defaultText: "http/json" },
+  ),
+  envSpec(
+    "T3CODE_MODE",
+    "web | desktop",
+    "Runtime mode. `desktop` keeps loopback defaults unless overridden.",
+    serverEnvironmentConfig.mode,
+    { defaultText: "web" },
+  ),
+  envSpec(
+    "T3CODE_PORT",
+    "port (1-65535)",
+    "Port for the HTTP/WebSocket server. Defaults to an auto-assigned free port.",
+    serverEnvironmentConfig.port,
+  ),
+  envSpec(
+    "T3CODE_HOST",
+    "host or IP address",
+    "Network interface to bind (for example 127.0.0.1 or a Tailnet IP).",
+    serverEnvironmentConfig.host,
+  ),
+  envSpec(
+    "T3CODE_HOME",
+    "directory path",
+    "T3 Code data directory; runtime state is stored under userdata.",
+    serverEnvironmentConfig.t3Home,
+  ),
+  envSpec(
+    "VITE_DEV_SERVER_URL",
+    "URL",
+    "Dev web URL to proxy/redirect to in development.",
+    serverEnvironmentConfig.devUrl,
+  ),
+  envSpec(
+    "T3CODE_DEV_ALLOWED_ORIGINS",
+    "comma-separated origins",
+    "Additional origins allowed to talk to the dev server.",
+    serverEnvironmentConfig.devAllowedOrigins,
+    { defaultText: "(empty)" },
+  ),
+  envSpec(
+    "T3CODE_NO_BROWSER",
+    "boolean",
+    "Disable automatic browser opening on startup.",
+    serverEnvironmentConfig.noBrowser,
+  ),
+  envSpec(
+    "T3CODE_BOOTSTRAP_FD",
+    "integer (file descriptor)",
+    "Read one-time bootstrap secrets from the given file descriptor.",
+    serverEnvironmentConfig.bootstrapFd,
+  ),
+  envSpec(
+    "T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD",
+    "boolean",
+    "Create a project for the working directory on startup when missing.",
+    serverEnvironmentConfig.autoBootstrapProjectFromCwd,
+  ),
+  envSpec(
+    "T3CODE_LOG_WS_EVENTS",
+    "boolean",
+    "Emit server-side logs for outbound WebSocket push traffic.",
+    serverEnvironmentConfig.logWebSocketEvents,
+  ),
+  envSpec(
+    "T3CODE_TAILSCALE_SERVE",
+    "boolean",
+    "Expose this backend over Tailscale Serve on the Tailnet.",
+    serverEnvironmentConfig.tailscaleServeEnabled,
+  ),
+  envSpec(
+    "T3CODE_TAILSCALE_SERVE_PORT",
+    "port (1-65535)",
+    "HTTPS port for Tailscale Serve when enabled.",
+    serverEnvironmentConfig.tailscaleServePort,
+    { defaultText: "443" },
+  ),
+  envSpec(
+    "T3CODE_DEV_AUTH_TOKEN",
+    "string with at least 32 characters",
+    "Reusable dev auth token for web dev mode. Values are redacted in this table.",
+    DevAuthTokenConfig,
+    { secret: true },
+  ),
+];
 
 export interface CliServerFlags {
   readonly validateConfig?: Option.Option<boolean> | undefined;
