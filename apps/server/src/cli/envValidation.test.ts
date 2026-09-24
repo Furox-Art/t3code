@@ -32,15 +32,18 @@ const rowFor = (
   variable: string,
 ): ServerEnvVariableRow | undefined => rows.find((row) => row.variable === variable);
 
+const isUserError = Schema.is(CliError.UserError);
+const isServerEnvValidationError = Schema.is(ServerEnvValidationError);
+
 const expectUserError = (error: unknown): CliError.UserError => {
-  if (!Schema.is(CliError.UserError)(error)) {
+  if (!isUserError(error)) {
     throw new Error("Expected UserError");
   }
   return error;
 };
 
 const expectValidationError = (error: unknown): ServerEnvValidationError => {
-  if (!Schema.is(ServerEnvValidationError)(error)) {
+  if (!isServerEnvValidationError(error)) {
     throw new Error("Expected ServerEnvValidationError");
   }
   return error;
@@ -67,6 +70,31 @@ const runValidationFlag = (args: ReadonlyArray<string>, env: Record<string, stri
     Effect.provide(
       Layer.mergeAll(NodeServices.layer, NetService.layer, configLayer(env), TestConsole.layer),
     ),
+  );
+
+const invalidStartupEnvironment: ReadonlyArray<readonly [string, string]> = [
+  ["T3CODE_TELEMETRY_ENABLED", "maybe"],
+  ["T3CODE_TELEMETRY_FLUSH_BATCH_SIZE", "many"],
+  ["T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS", "many"],
+  ["T3CODE_POSTHOG_HOST", "not a url"],
+  ["T3CODE_BITBUCKET_API_BASE_URL", "not a url"],
+  ["T3CODE_RELAY_URL", "http://relay.example.test"],
+  ["T3CODE_HOSTED_APP_URL", "not a url"],
+  ["T3CODE_RELAY_CLIENT_OTLP_TRACES_URL", "not a url"],
+  ["T3CODE_RELEASE_BASE_URL", "not a url"],
+];
+
+const runNormalStartup = (env: Record<string, string>) =>
+  runServerCommand(serverFlags()).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        NetService.layer,
+        Layer.succeed(GlobalFlag.LogLevel, Option.none()),
+        configLayer(env),
+      ),
+    ),
+    Effect.flip,
   );
 
 describe("server environment validation", () => {
@@ -148,6 +176,23 @@ describe("server environment validation", () => {
     }),
   );
 
+  it.effect("rejects every discovered startup value in both startup paths", () =>
+    Effect.gen(function* () {
+      for (const [variable, value] of invalidStartupEnvironment) {
+        const env = { [variable]: value };
+        const validationError = expectValidationError(yield* runValidation(env).pipe(Effect.flip));
+        assert.strictEqual(rowFor(validationError.rows, variable)?.status, "invalid");
+
+        const normalError = expectUserError(yield* runNormalStartup(env));
+        const flagError = expectUserError(
+          yield* runValidationFlag(["--validate-config"], env).pipe(Effect.flip),
+        );
+        assert.include(normalError.userMessage ?? "", variable);
+        assert.include(flagError.userMessage ?? "", variable);
+      }
+    }),
+  );
+
   it.effect("rejects values through the same Config decoders used by startup", () =>
     Effect.gen(function* () {
       const validationError = yield* runValidation({
@@ -199,25 +244,53 @@ describe("server environment validation", () => {
     }),
   );
 
+  it.effect("accepts secure relay trace endpoints with paths", () =>
+    Effect.gen(function* () {
+      const rows = yield* runValidation({
+        T3CODE_RELAY_CLIENT_OTLP_TRACES_URL: "https://relay.example.test/v1/traces",
+      });
+      assert.equal(
+        rows.find((row) => row.variable === "T3CODE_RELAY_CLIENT_OTLP_TRACES_URL")?.status,
+        "ok",
+      );
+    }),
+  );
+
   it.effect("redacts complete secret values from failure output", () =>
     Effect.gen(function* () {
       const devToken = "short-development-secret";
       const headerSecret = "super-secret-header-value";
+      const posthogSecret = "posthog-secret-value";
+      const bitbucketSecret = "bitbucket-secret-value";
+      const relayTraceSecret = "relay-trace-secret-value";
       const error = yield* runServerEnvironmentValidation.pipe(
         Effect.provide(
           configLayer({
             T3CODE_DEV_AUTH_TOKEN: devToken,
             T3CODE_OTLP_HEADERS: `authorization=${headerSecret}, malformed`,
+            T3CODE_POSTHOG_KEY: posthogSecret,
+            T3CODE_BITBUCKET_ACCESS_TOKEN: bitbucketSecret,
+            T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN: relayTraceSecret,
           }),
         ),
         Effect.flip,
       );
 
       const userError = expectUserError(error);
-      assert.notInclude(userError.userMessage ?? "", devToken);
-      assert.notInclude(userError.userMessage ?? "", headerSecret);
+      for (const secret of [
+        devToken,
+        headerSecret,
+        posthogSecret,
+        bitbucketSecret,
+        relayTraceSecret,
+      ]) {
+        assert.notInclude(userError.userMessage ?? "", secret);
+      }
       assert.include(userError.userMessage ?? "", "T3CODE_DEV_AUTH_TOKEN");
       assert.include(userError.userMessage ?? "", "T3CODE_OTLP_HEADERS");
+      assert.include(userError.userMessage ?? "", "T3CODE_POSTHOG_KEY");
+      assert.include(userError.userMessage ?? "", "T3CODE_BITBUCKET_ACCESS_TOKEN");
+      assert.include(userError.userMessage ?? "", "T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN");
       assert.include(userError.userMessage ?? "", "<redacted>");
     }),
   );

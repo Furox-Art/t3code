@@ -1,5 +1,6 @@
 import * as NetService from "@t3tools/shared/Net";
 import { OtlpHeadersFromString, OtlpProtocol } from "@t3tools/shared/observability";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
 import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
@@ -84,12 +85,14 @@ const validateConfigFlag = Flag.Boolean("validate-config").pipe(
   Flag.optional,
 );
 
+const decodeUrlFromString = Schema.decodeExit(Schema.URLFromString);
+
 const ValidUrlStringFromString = Schema.String.pipe(
   Schema.decodeTo(
     Schema.String,
     SchemaTransformation.transformEffect({
       decode: (value) =>
-        Exit.isSuccess(Schema.decodeExit(Schema.URLFromString)(value))
+        Exit.isSuccess(decodeUrlFromString(value))
           ? Effect.succeed(value)
           : Effect.fail(
               new SchemaIssue.InvalidValue({
@@ -100,6 +103,114 @@ const ValidUrlStringFromString = Schema.String.pipe(
     }),
   ),
 );
+
+const SecureHttpUrlStringFromString = Schema.String.pipe(
+  Schema.decodeTo(
+    Schema.String,
+    SchemaTransformation.transformEffect({
+      decode: (value) => {
+        try {
+          const url = new URL(value);
+          if (url.protocol !== "https:" || url.username.length > 0 || url.password.length > 0) {
+            throw new Error("invalid secure URL");
+          }
+          return Effect.succeed(value);
+        } catch {
+          return Effect.fail(
+            new SchemaIssue.InvalidValue({
+              message: `expected a secure URL, received "${value}"`,
+            }),
+          );
+        }
+      },
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
+
+const HostedAppUrlStringFromString = Schema.String.pipe(
+  Schema.decodeTo(
+    Schema.String,
+    SchemaTransformation.transformEffect({
+      decode: (value) => {
+        try {
+          const url = new URL(value);
+          const isLoopbackHttp =
+            url.protocol === "http:" &&
+            (url.hostname === "localhost" ||
+              url.hostname === "127.0.0.1" ||
+              url.hostname === "[::1]");
+          if (
+            (url.protocol !== "https:" && !isLoopbackHttp) ||
+            url.pathname !== "/" ||
+            url.search !== "" ||
+            url.hash !== ""
+          ) {
+            throw new Error("invalid hosted app origin");
+          }
+          return Effect.succeed(value);
+        } catch {
+          return Effect.fail(
+            new SchemaIssue.InvalidValue({
+              message: `expected a hosted app origin, received "${value}"`,
+            }),
+          );
+        }
+      },
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
+
+const decodeHostedAppUrlFromString = Schema.decodeExit(HostedAppUrlStringFromString);
+
+export const makePublicValueConfig = (name: string, fallback = "") => {
+  const runtimeConfig = Config.NonEmptyString(name);
+  return (fallback ? runtimeConfig.pipe(Config.withDefault(fallback)) : runtimeConfig).pipe(
+    Config.map((value) => value.trim()),
+  );
+};
+
+export const makeRelayUrlConfig = (fallback = "") => {
+  const runtimeConfig = Config.NonEmptyString("T3CODE_RELAY_URL");
+  return (fallback ? runtimeConfig.pipe(Config.withDefault(fallback)) : runtimeConfig).pipe(
+    Config.mapEffect((value) => {
+      const normalized = normalizeSecureRelayUrl(value);
+      return normalized === null
+        ? Effect.fail(
+            new Config.ConfigError(
+              new Schema.SchemaError(
+                new SchemaIssue.InvalidValue({
+                  message: "Relay URL must be a secure absolute HTTPS origin.",
+                }),
+              ),
+            ),
+          )
+        : Effect.succeed(normalized);
+    }),
+  );
+};
+
+export const makeHostedAppUrlConfig = (fallback = "") => {
+  const runtimeConfig = Config.NonEmptyString("T3CODE_HOSTED_APP_URL");
+  return (fallback ? runtimeConfig.pipe(Config.withDefault(fallback)) : runtimeConfig).pipe(
+    Config.mapEffect((value) => {
+      const result = decodeHostedAppUrlFromString(value);
+      return Exit.isSuccess(result)
+        ? Effect.succeed(new URL(value).origin)
+        : Effect.fail(
+            new Config.ConfigError(
+              new Schema.SchemaError(
+                new SchemaIssue.InvalidValue({
+                  message:
+                    "Hosted app URL must be an absolute HTTPS origin (or HTTP loopback origin).",
+                }),
+              ),
+            ),
+          );
+    }),
+  );
+};
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
   Config.map((token) => Redacted.make(Redacted.value(token).trim())),
@@ -121,7 +232,7 @@ const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
   Config.map(Option.getOrUndefined),
 );
 
-const serverEnvironmentConfig = {
+export const serverEnvironmentConfig = {
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
@@ -193,6 +304,48 @@ const serverEnvironmentConfig = {
     Config.map(Option.getOrUndefined),
   ),
   tailscaleServePort: Config.Port("T3CODE_TAILSCALE_SERVE_PORT").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  telemetryEnabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(true)),
+  telemetryFlushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(
+    Config.withDefault(20),
+  ),
+  telemetryMaxBufferedEvents: Config.Number("T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS").pipe(
+    Config.withDefault(1_000),
+  ),
+  posthogKey: Config.String("T3CODE_POSTHOG_KEY").pipe(
+    Config.withDefault("phc_XOWci4oZP4VvLiEyrFqkFjP4CZn55mjYYBMREK5Wd6m"),
+  ),
+  posthogHost: Config.schema(ValidUrlStringFromString, "T3CODE_POSTHOG_HOST").pipe(
+    Config.withDefault("https://us.i.posthog.com"),
+  ),
+  wslDistroName: Config.String("WSL_DISTRO_NAME").pipe(Config.option),
+  bitbucketApiBaseUrl: Config.schema(
+    ValidUrlStringFromString,
+    "T3CODE_BITBUCKET_API_BASE_URL",
+  ).pipe(Config.withDefault("https://api.bitbucket.org/2.0")),
+  bitbucketAccessToken: Config.String("T3CODE_BITBUCKET_ACCESS_TOKEN").pipe(Config.option),
+  bitbucketEmail: Config.String("T3CODE_BITBUCKET_EMAIL").pipe(Config.option),
+  bitbucketApiToken: Config.String("T3CODE_BITBUCKET_API_TOKEN").pipe(Config.option),
+  cloudflaredPath: makePublicValueConfig("T3CODE_CLOUDFLARED_PATH").pipe(Config.option),
+  relayUrl: makeRelayUrlConfig().pipe(Config.option),
+  hostedAppUrl: makeHostedAppUrlConfig().pipe(Config.option),
+  clerkPublishableKey: makePublicValueConfig("T3CODE_CLERK_PUBLISHABLE_KEY").pipe(Config.option),
+  clerkCliOAuthClientId: makePublicValueConfig("T3CODE_CLERK_CLI_OAUTH_CLIENT_ID").pipe(
+    Config.option,
+  ),
+  relayClientTracesUrl: Config.schema(
+    SecureHttpUrlStringFromString,
+    "T3CODE_RELAY_CLIENT_OTLP_TRACES_URL",
+  ).pipe(Config.option),
+  relayClientTracesDataset: makePublicValueConfig("T3CODE_RELAY_CLIENT_OTLP_TRACES_DATASET").pipe(
+    Config.option,
+  ),
+  relayClientTracesToken: makePublicValueConfig("T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN").pipe(
+    Config.option,
+  ),
+  releaseBaseUrl: Config.schema(ValidUrlStringFromString, "T3CODE_RELEASE_BASE_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
@@ -403,6 +556,132 @@ export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
     "Reusable dev auth token for web dev mode. Values are redacted in this table.",
     DevAuthTokenConfig,
     { secret: true },
+  ),
+  envSpec(
+    "T3CODE_TELEMETRY_ENABLED",
+    "boolean",
+    "Enable anonymous product telemetry.",
+    serverEnvironmentConfig.telemetryEnabled,
+    { defaultText: "true" },
+  ),
+  envSpec(
+    "T3CODE_TELEMETRY_FLUSH_BATCH_SIZE",
+    "number",
+    "Number of telemetry events flushed per batch.",
+    serverEnvironmentConfig.telemetryFlushBatchSize,
+    { defaultText: "20" },
+  ),
+  envSpec(
+    "T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS",
+    "number",
+    "Maximum number of buffered telemetry events.",
+    serverEnvironmentConfig.telemetryMaxBufferedEvents,
+    { defaultText: "1000" },
+  ),
+  envSpec(
+    "T3CODE_POSTHOG_KEY",
+    "string",
+    "PostHog project key. Values are redacted in this table.",
+    serverEnvironmentConfig.posthogKey,
+    { defaultText: "(configured)", secret: true },
+  ),
+  envSpec(
+    "T3CODE_POSTHOG_HOST",
+    "URL",
+    "PostHog telemetry host.",
+    serverEnvironmentConfig.posthogHost,
+    { defaultText: "https://us.i.posthog.com" },
+  ),
+  envSpec(
+    "WSL_DISTRO_NAME",
+    "string",
+    "WSL distribution name included in telemetry metadata.",
+    serverEnvironmentConfig.wslDistroName,
+  ),
+  envSpec(
+    "T3CODE_BITBUCKET_API_BASE_URL",
+    "URL",
+    "Bitbucket API base URL.",
+    serverEnvironmentConfig.bitbucketApiBaseUrl,
+    { defaultText: "https://api.bitbucket.org/2.0" },
+  ),
+  envSpec(
+    "T3CODE_BITBUCKET_ACCESS_TOKEN",
+    "string",
+    "Bitbucket access token. Values are redacted in this table.",
+    serverEnvironmentConfig.bitbucketAccessToken,
+    { secret: true },
+  ),
+  envSpec(
+    "T3CODE_BITBUCKET_EMAIL",
+    "string",
+    "Bitbucket account email.",
+    serverEnvironmentConfig.bitbucketEmail,
+  ),
+  envSpec(
+    "T3CODE_BITBUCKET_API_TOKEN",
+    "string",
+    "Bitbucket API token. Values are redacted in this table.",
+    serverEnvironmentConfig.bitbucketApiToken,
+    { secret: true },
+  ),
+  envSpec(
+    "T3CODE_CLOUDFLARED_PATH",
+    "file path",
+    "Optional path to the cloudflared executable.",
+    serverEnvironmentConfig.cloudflaredPath,
+  ),
+  envSpec(
+    "T3CODE_RELAY_URL",
+    "secure URL",
+    "T3 Connect relay URL.",
+    serverEnvironmentConfig.relayUrl,
+    { defaultText: "(build-time or unset)" },
+  ),
+  envSpec(
+    "T3CODE_HOSTED_APP_URL",
+    "URL",
+    "Hosted app origin used for T3 Connect OAuth.",
+    serverEnvironmentConfig.hostedAppUrl,
+  ),
+  envSpec(
+    "T3CODE_CLERK_PUBLISHABLE_KEY",
+    "string",
+    "Clerk publishable key used for T3 Connect.",
+    serverEnvironmentConfig.clerkPublishableKey,
+    { defaultText: "(build-time or unset)" },
+  ),
+  envSpec(
+    "T3CODE_CLERK_CLI_OAUTH_CLIENT_ID",
+    "string",
+    "Public Clerk CLI OAuth client ID.",
+    serverEnvironmentConfig.clerkCliOAuthClientId,
+    { defaultText: "(build-time or unset)" },
+  ),
+  envSpec(
+    "T3CODE_RELAY_CLIENT_OTLP_TRACES_URL",
+    "URL",
+    "Relay client OTLP trace endpoint.",
+    serverEnvironmentConfig.relayClientTracesUrl,
+  ),
+  envSpec(
+    "T3CODE_RELAY_CLIENT_OTLP_TRACES_DATASET",
+    "string",
+    "Relay client OTLP trace dataset.",
+    serverEnvironmentConfig.relayClientTracesDataset,
+  ),
+  envSpec(
+    "T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN",
+    "string",
+    "Relay client OTLP trace token. Values are redacted in this table.",
+    serverEnvironmentConfig.relayClientTracesToken,
+    { secret: true },
+  ),
+  envSpec(
+    "T3CODE_RELEASE_BASE_URL",
+    "URL",
+    "CLI release download base URL override.",
+    serverEnvironmentConfig.releaseBaseUrl,
   ),
 ];
 
