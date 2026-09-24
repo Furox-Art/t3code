@@ -5,7 +5,10 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as CliError from "effect/unstable/cli/CliError";
 
+import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+
 import { type ServerEnvVarSpec, serverEnvSpecs } from "./config.ts";
+import * as ResourceMonitorBinary from "../resourceTelemetry/ResourceMonitorBinary.ts";
 
 export interface ServerEnvVariableRow {
   readonly variable: string;
@@ -96,12 +99,31 @@ const defaultReceived = (spec: ServerEnvVarSpec) =>
 
 export const validateServerEnvironment = Effect.gen(function* () {
   const provider = yield* ConfigProvider.ConfigProvider;
+  const platform = yield* HostProcessPlatform;
+  const architecture = yield* HostProcessArchitecture;
   const rows: Array<ServerEnvVariableRow> = [];
 
   for (const spec of serverEnvSpecs) {
     const raw = (yield* provider.load([spec.variable]))?.value;
     const decoded = yield* Effect.result(spec.config);
-    const valid = Result.isSuccess(decoded);
+    let valid = Result.isSuccess(decoded);
+    if (
+      valid &&
+      raw !== undefined &&
+      spec.variable === "T3CODE_RESOURCE_MONITOR_PATH" &&
+      Result.isSuccess(decoded)
+    ) {
+      const value = Result.getOrThrow(decoded);
+      if (typeof value !== "string" || value.length === 0) {
+        valid = false;
+      } else {
+        valid = Result.isSuccess(
+          yield* Effect.result(
+            ResourceMonitorBinary.validateResourceMonitorOverride(value, platform, architecture),
+          ),
+        );
+      }
+    }
     rows.push({
       variable: spec.variable,
       expected: spec.expected,

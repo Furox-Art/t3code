@@ -19,6 +19,7 @@ import { Argument, Flag } from "effect/unstable/cli";
 
 import { readBootstrapEnvelope } from "../bootstrap.ts";
 import * as ServerConfig from "../config.ts";
+import { parseCodexLaunchArgs } from "../provider/Layers/codexLaunchArgs.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
@@ -232,6 +233,55 @@ const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
   Config.map(Option.getOrUndefined),
 );
 
+const invalidEnvironmentValue = (message: string) =>
+  Effect.fail(
+    new Config.ConfigError(
+      new Schema.SchemaError(
+        new SchemaIssue.InvalidValue({
+          message,
+        }),
+      ),
+    ),
+  );
+
+const codexLaunchArgsConfig = Config.String("T3CODE_CODEX_LAUNCH_ARGS").pipe(
+  Config.option,
+  Config.map(Option.getOrUndefined),
+  Config.mapEffect((value) => {
+    if (value === undefined || value.trim().length === 0) return Effect.succeed(undefined);
+    try {
+      return Effect.succeed(parseCodexLaunchArgs(value));
+    } catch {
+      return invalidEnvironmentValue("T3CODE_CODEX_LAUNCH_ARGS contains invalid quoting.");
+    }
+  }),
+);
+
+const isAbsolutePathSyntax = (value: string) =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith("\\\\");
+
+const resourceMonitorPathConfig = Config.String("T3CODE_RESOURCE_MONITOR_PATH").pipe(
+  Config.option,
+  Config.map(Option.getOrUndefined),
+  Config.mapEffect((value) => {
+    if (value === undefined) return Effect.succeed(undefined);
+    const normalized = value.trim();
+    if (normalized.length === 0) return Effect.succeed(undefined);
+    if (
+      normalized.length > 4096 ||
+      normalized.includes("\0") ||
+      normalized.includes("\r") ||
+      normalized.includes("\n") ||
+      !isAbsolutePathSyntax(normalized)
+    ) {
+      return invalidEnvironmentValue(
+        "T3CODE_RESOURCE_MONITOR_PATH must be an absolute executable path.",
+      );
+    }
+    return Effect.succeed(normalized);
+  }),
+);
+
 export const serverEnvironmentConfig = {
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
@@ -310,6 +360,8 @@ export const serverEnvironmentConfig = {
   strictProviderLifecycleGuard: Config.Boolean("T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD").pipe(
     Config.withDefault(true),
   ),
+  codexLaunchArgs: codexLaunchArgsConfig,
+  resourceMonitorPath: resourceMonitorPathConfig,
   telemetryEnabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(true)),
   telemetryFlushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(
     Config.withDefault(20),
@@ -566,6 +618,20 @@ export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
     "Require provider lifecycle events to match the active turn.",
     serverEnvironmentConfig.strictProviderLifecycleGuard,
     { defaultText: "true" },
+  ),
+  envSpec(
+    "T3CODE_CODEX_LAUNCH_ARGS",
+    "quoted argument list",
+    "Codex launch arguments. Invalid quoting is rejected. Values are redacted in this table.",
+    serverEnvironmentConfig.codexLaunchArgs,
+    { secret: true },
+  ),
+  envSpec(
+    "T3CODE_RESOURCE_MONITOR_PATH",
+    "absolute executable path",
+    "Optional resource monitor executable override. Values are redacted in this table.",
+    serverEnvironmentConfig.resourceMonitorPath,
+    { secret: true },
   ),
   envSpec(
     "T3CODE_TELEMETRY_ENABLED",
@@ -862,7 +928,7 @@ export const resolveServerConfig = (
     const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
     const desktopTelemetryFd = bootstrap?.desktopTelemetryFd;
     const desktopTelemetryControlFd = bootstrap?.desktopTelemetryControlFd;
-    const resourceMonitorPath = bootstrap?.resourceMonitorPath;
+    const resourceMonitorPath = env.resourceMonitorPath ?? bootstrap?.resourceMonitorPath;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
         Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
@@ -944,6 +1010,7 @@ export const resolveServerConfig = (
       desktopTelemetryFd,
       desktopTelemetryControlFd,
       resourceMonitorPath,
+      codexLaunchArgs: env.codexLaunchArgs,
       autoBootstrapProjectFromCwd,
       logWebSocketEvents,
       tailscaleServeEnabled,

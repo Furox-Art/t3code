@@ -11,8 +11,10 @@ import * as TestConsole from "effect/testing/TestConsole";
 import { Command, GlobalFlag } from "effect/unstable/cli";
 import * as CliError from "effect/unstable/cli/CliError";
 
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+
 import { makeCli } from "../bin.ts";
-import { type CliServerFlags, serverEnvSpecs } from "./config.ts";
+import { type CliServerFlags, serverEnvSpecs, serverEnvironmentConfig } from "./config.ts";
 import {
   type ServerEnvVariableRow,
   ServerEnvValidationError,
@@ -25,7 +27,9 @@ const configLayer = (env: Record<string, string>) =>
   ConfigProvider.layer(ConfigProvider.fromEnv({ env }));
 
 const runValidation = (env: Record<string, string>) =>
-  validateServerEnvironment.pipe(Effect.provide(configLayer(env)));
+  validateServerEnvironment.pipe(
+    Effect.provide(Layer.mergeAll(configLayer(env), NodeServices.layer)),
+  );
 
 const rowFor = (
   rows: ReadonlyArray<ServerEnvVariableRow>,
@@ -74,6 +78,8 @@ const runValidationFlag = (args: ReadonlyArray<string>, env: Record<string, stri
 
 const invalidStartupEnvironment: ReadonlyArray<readonly [string, string]> = [
   ["T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD", "maybe"],
+  ["T3CODE_CODEX_LAUNCH_ARGS", '"unterminated'],
+  ["T3CODE_RESOURCE_MONITOR_PATH", "relative/resource-monitor"],
   ["T3CODE_TELEMETRY_ENABLED", "maybe"],
   ["T3CODE_TELEMETRY_FLUSH_BATCH_SIZE", "many"],
   ["T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS", "many"],
@@ -102,7 +108,7 @@ describe("server environment validation", () => {
   it.effect("prints every optional and default row on success", () =>
     Effect.gen(function* () {
       yield* runServerEnvironmentValidation.pipe(
-        Effect.provide(Layer.mergeAll(configLayer({}), TestConsole.layer)),
+        Effect.provide(Layer.mergeAll(configLayer({}), NodeServices.layer, TestConsole.layer)),
       );
       const output = (yield* TestConsole.logLines)
         .filter((line): line is string => typeof line === "string")
@@ -122,7 +128,13 @@ describe("server environment validation", () => {
   it.effect("prints defaults alongside failures", () =>
     Effect.gen(function* () {
       const error = yield* runServerEnvironmentValidation.pipe(
-        Effect.provide(configLayer({ T3CODE_PORT: "70000" })),
+        Effect.provide(
+          Layer.mergeAll(
+            configLayer({ T3CODE_PORT: "70000" }),
+            NodeServices.layer,
+            TestConsole.layer,
+          ),
+        ),
         Effect.flip,
       );
 
@@ -164,6 +176,18 @@ describe("server environment validation", () => {
       ]) {
         const result = yield* runValidationFlag(args, {}).pipe(Effect.exit);
         assert.isTrue(Exit.isSuccess(result));
+      }
+
+      for (const args of [
+        ["--validate-config"],
+        ["start", "--validate-config"],
+        ["serve", "--validate-config"],
+      ]) {
+        const valid = yield* runValidationFlag(args, {
+          T3CODE_CODEX_LAUNCH_ARGS: '--enable "feature flag"',
+          T3CODE_RESOURCE_MONITOR_PATH: process.execPath,
+        }).pipe(Effect.exit);
+        assert.isTrue(Exit.isSuccess(valid));
       }
 
       for (const args of [
@@ -259,6 +283,65 @@ describe("server environment validation", () => {
     }),
   );
 
+  it.effect("parses validated Codex launch arguments and preserves the default", () =>
+    Effect.gen(function* () {
+      const value = '--enable "feature flag" --config model="gpt 5"';
+      const rows = yield* runValidation({ T3CODE_CODEX_LAUNCH_ARGS: value });
+      assert.equal(rows.find((row) => row.variable === "T3CODE_CODEX_LAUNCH_ARGS")?.status, "ok");
+      const args = yield* serverEnvironmentConfig.codexLaunchArgs.pipe(
+        Effect.provide(configLayer({ T3CODE_CODEX_LAUNCH_ARGS: value })),
+      );
+      assert.deepEqual(args, ["--enable", "feature flag", "--config", "model=gpt 5"]);
+
+      const defaultRows = yield* runValidation({});
+      assert.equal(
+        defaultRows.find((row) => row.variable === "T3CODE_CODEX_LAUNCH_ARGS")?.received,
+        "(unset)",
+      );
+      const defaultArgs = yield* serverEnvironmentConfig.codexLaunchArgs.pipe(
+        Effect.provide(configLayer({})),
+      );
+      assert.isUndefined(defaultArgs);
+    }),
+  );
+
+  it.effect("validates a present resource monitor executable and allows its default", () =>
+    Effect.gen(function* () {
+      const rows = yield* runValidation({ T3CODE_RESOURCE_MONITOR_PATH: process.execPath });
+      assert.equal(
+        rows.find((row) => row.variable === "T3CODE_RESOURCE_MONITOR_PATH")?.status,
+        "ok",
+      );
+      const defaultRows = yield* runValidation({});
+      assert.equal(
+        defaultRows.find((row) => row.variable === "T3CODE_RESOURCE_MONITOR_PATH")?.received,
+        "(unset)",
+      );
+    }),
+  );
+
+  it.effect("rejects a missing resource monitor override in validation and startup", () =>
+    Effect.gen(function* () {
+      const platform = yield* HostProcessPlatform;
+      const missingPath =
+        platform === "win32"
+          ? "C:\\missing-t3-resource-monitor.exe"
+          : "/missing-t3-resource-monitor";
+      const env = { T3CODE_RESOURCE_MONITOR_PATH: missingPath };
+      const validationError = expectValidationError(yield* runValidation(env).pipe(Effect.flip));
+      assert.strictEqual(
+        rowFor(validationError.rows, "T3CODE_RESOURCE_MONITOR_PATH")?.status,
+        "invalid",
+      );
+      const normalError = expectUserError(yield* runNormalStartup(env));
+      const flagError = expectUserError(
+        yield* runValidationFlag(["--validate-config"], env).pipe(Effect.flip),
+      );
+      assert.include(normalError.userMessage ?? "", "T3CODE_RESOURCE_MONITOR_PATH");
+      assert.include(flagError.userMessage ?? "", "T3CODE_RESOURCE_MONITOR_PATH");
+    }),
+  );
+
   it.effect("accepts secure relay trace endpoints with paths", () =>
     Effect.gen(function* () {
       const rows = yield* runValidation({
@@ -278,15 +361,23 @@ describe("server environment validation", () => {
       const posthogSecret = "posthog-secret-value";
       const bitbucketSecret = "bitbucket-secret-value";
       const relayTraceSecret = "relay-trace-secret-value";
+      const codexArgsSecret = "codex-args-secret-value";
+      const resourceMonitorSecret = "resource-monitor-secret-value";
       const error = yield* runServerEnvironmentValidation.pipe(
         Effect.provide(
-          configLayer({
-            T3CODE_DEV_AUTH_TOKEN: devToken,
-            T3CODE_OTLP_HEADERS: `authorization=${headerSecret}, malformed`,
-            T3CODE_POSTHOG_KEY: posthogSecret,
-            T3CODE_BITBUCKET_ACCESS_TOKEN: bitbucketSecret,
-            T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN: relayTraceSecret,
-          }),
+          Layer.mergeAll(
+            configLayer({
+              T3CODE_DEV_AUTH_TOKEN: devToken,
+              T3CODE_OTLP_HEADERS: `authorization=${headerSecret}, malformed`,
+              T3CODE_POSTHOG_KEY: posthogSecret,
+              T3CODE_BITBUCKET_ACCESS_TOKEN: bitbucketSecret,
+              T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN: relayTraceSecret,
+              T3CODE_CODEX_LAUNCH_ARGS: `--config token=${codexArgsSecret}`,
+              T3CODE_RESOURCE_MONITOR_PATH: `relative/${resourceMonitorSecret}`,
+            }),
+            NodeServices.layer,
+            TestConsole.layer,
+          ),
         ),
         Effect.flip,
       );
@@ -298,6 +389,8 @@ describe("server environment validation", () => {
         posthogSecret,
         bitbucketSecret,
         relayTraceSecret,
+        codexArgsSecret,
+        resourceMonitorSecret,
       ]) {
         assert.notInclude(userError.userMessage ?? "", secret);
       }
@@ -306,6 +399,8 @@ describe("server environment validation", () => {
       assert.include(userError.userMessage ?? "", "T3CODE_POSTHOG_KEY");
       assert.include(userError.userMessage ?? "", "T3CODE_BITBUCKET_ACCESS_TOKEN");
       assert.include(userError.userMessage ?? "", "T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN");
+      assert.include(userError.userMessage ?? "", "T3CODE_CODEX_LAUNCH_ARGS");
+      assert.include(userError.userMessage ?? "", "T3CODE_RESOURCE_MONITOR_PATH");
       assert.include(userError.userMessage ?? "", "<redacted>");
     }),
   );
