@@ -38,8 +38,10 @@ export class ServerEnvValidationError extends Schema.TaggedError<ServerEnvValida
   }
 }
 
+const secretVariableNamePattern = /TOKEN|SECRET|KEY|PASSWORD/i;
+
 const redact = (spec: ServerEnvVarSpec, value: string) =>
-  spec.secret || /TOKEN|SECRET|KEY|PASSWORD/i.test(spec.variable) ? "<redacted>" : value;
+  spec.secret || secretVariableNamePattern.test(spec.variable) ? "<redacted>" : value;
 
 const renderReceived = (row: ServerEnvVariableRow) => {
   if (row.received === undefined) return "—";
