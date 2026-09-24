@@ -73,6 +73,7 @@ const runValidationFlag = (args: ReadonlyArray<string>, env: Record<string, stri
   );
 
 const invalidStartupEnvironment: ReadonlyArray<readonly [string, string]> = [
+  ["T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD", "maybe"],
   ["T3CODE_TELEMETRY_ENABLED", "maybe"],
   ["T3CODE_TELEMETRY_FLUSH_BATCH_SIZE", "many"],
   ["T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS", "many"],
@@ -241,6 +242,20 @@ describe("server environment validation", () => {
       });
 
       assert.equal(rows.filter((row) => row.status !== "ok").length, 0);
+    }),
+  );
+
+  it.effect("accepts strict lifecycle guard boolean aliases", () =>
+    Effect.gen(function* () {
+      for (const value of ["false", "0", "off", "no"]) {
+        const rows = yield* runValidation({
+          T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD: value,
+        });
+        assert.equal(
+          rows.find((row) => row.variable === "T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD")?.status,
+          "ok",
+        );
+      }
     }),
   );
 

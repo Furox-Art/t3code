@@ -307,6 +307,9 @@ export const serverEnvironmentConfig = {
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  strictProviderLifecycleGuard: Config.Boolean("T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD").pipe(
+    Config.withDefault(true),
+  ),
   telemetryEnabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(true)),
   telemetryFlushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(
     Config.withDefault(20),
@@ -556,6 +559,13 @@ export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
     "Reusable dev auth token for web dev mode. Values are redacted in this table.",
     DevAuthTokenConfig,
     { secret: true },
+  ),
+  envSpec(
+    "T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD",
+    "boolean",
+    "Require provider lifecycle events to match the active turn.",
+    serverEnvironmentConfig.strictProviderLifecycleGuard,
+    { defaultText: "true" },
   ),
   envSpec(
     "T3CODE_TELEMETRY_ENABLED",
