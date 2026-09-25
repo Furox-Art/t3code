@@ -1,8 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodePath from "@effect/platform-node/NodePath";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { afterEach, assert, describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 
 import { ServerConfig } from "../config.ts";
 import * as ResourceMonitorBinary from "./ResourceMonitorBinary.ts";
@@ -12,6 +14,37 @@ import * as ResourceMonitorBinary from "./ResourceMonitorBinary.ts";
 const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 describe("ResourceMonitorBinary", () => {
+  it.effect("uses the injected path service for cross-platform absolute paths", () =>
+    Effect.gen(function* () {
+      const posixPath = yield* Path.Path.pipe(Effect.provide(NodePath.layerPosix));
+      const win32Path = yield* Path.Path.pipe(Effect.provide(NodePath.layerWin32));
+
+      assert.isTrue(
+        ResourceMonitorBinary.isResourceMonitorPathAbsolute("/tmp/monitor", "linux", posixPath),
+      );
+      assert.isFalse(
+        ResourceMonitorBinary.isResourceMonitorPathAbsolute("C:\\tmp\\monitor", "linux", posixPath),
+      );
+      assert.isTrue(
+        ResourceMonitorBinary.isResourceMonitorPathAbsolute(
+          "C:\\tmp\\monitor.exe",
+          "win32",
+          win32Path,
+        ),
+      );
+      assert.isTrue(
+        ResourceMonitorBinary.isResourceMonitorPathAbsolute(
+          "\\\\server\\share\\monitor.exe",
+          "win32",
+          win32Path,
+        ),
+      );
+      assert.isFalse(
+        ResourceMonitorBinary.isResourceMonitorPathAbsolute("/tmp/monitor", "win32", win32Path),
+      );
+    }),
+  );
+
   afterEach(() => {
     vi.restoreAllMocks();
   });

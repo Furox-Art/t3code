@@ -1,5 +1,3 @@
-import * as NodePath from "node:path";
-
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -149,6 +147,7 @@ function resourceMonitorRustTarget(
 export const isResourceMonitorPathAbsolute = (
   candidate: string,
   platform: NodeJS.Platform,
+  path: Path.Path,
 ): boolean => {
   if (
     candidate.length === 0 ||
@@ -161,17 +160,18 @@ export const isResourceMonitorPathAbsolute = (
   }
   if (platform === "win32") {
     return (
-      NodePath.win32.isAbsolute(candidate) &&
+      path.isAbsolute(candidate) &&
       (/^[A-Za-z]:[\\/]/u.test(candidate) || candidate.startsWith("\\\\"))
     );
   }
-  return NodePath.posix.isAbsolute(candidate);
+  return path.isAbsolute(candidate);
 };
 
 export const validateResourceMonitorOverride = Effect.fn(
   "resourceTelemetry.resourceMonitorBinary.validateOverride",
 )(function* (candidate: string, platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
-  if (!isResourceMonitorPathAbsolute(candidate, platform)) {
+  const path = yield* Path.Path;
+  if (!isResourceMonitorPathAbsolute(candidate, platform, path)) {
     return yield* new ResourceMonitorBinaryInvalidPath({
       path: candidate,
       reason: "expected an absolute path",
@@ -214,6 +214,7 @@ export const make = Effect.fn("resourceTelemetry.resourceMonitorBinary.make")(fu
     const override = config.resourceMonitorPath;
     const resolve: ResourceMonitorBinary["Service"]["resolve"] = Effect.gen(function* () {
       yield* validateResourceMonitorOverride(override, platform, architecture).pipe(
+        Effect.provideService(Path.Path, path),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
       );
       return override;
