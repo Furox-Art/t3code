@@ -19,6 +19,7 @@ import {
   type ServerEnvVariableRow,
   ServerEnvValidationError,
   runServerEnvironmentValidation,
+  runValidateConfig,
   validateServerEnvironment,
 } from "./envValidation.ts";
 import { runServerCommand } from "./server.ts";
@@ -107,7 +108,7 @@ const runNormalStartup = (env: Record<string, string>) =>
 describe("server environment validation", () => {
   it.effect("prints every optional and default row on success", () =>
     Effect.gen(function* () {
-      yield* runServerEnvironmentValidation.pipe(
+      yield* runValidateConfig.pipe(
         Effect.provide(Layer.mergeAll(configLayer({}), NodeServices.layer, TestConsole.layer)),
       );
       const output = (yield* TestConsole.logLines)

@@ -142,10 +142,7 @@ export const validateServerEnvironment = Effect.gen(function* () {
   return rows;
 });
 
-export const runServerEnvironmentValidation = Effect.gen(function* () {
-  const rows = yield* validateServerEnvironment;
-  yield* Console.log(formatEnvValidationTable(rows, "succeeded"));
-}).pipe(
+const validateServerEnvironmentOrUserError = validateServerEnvironment.pipe(
   Effect.catchTags({
     ServerEnvValidationError: (error) =>
       Effect.fail(
@@ -157,7 +154,10 @@ export const runServerEnvironmentValidation = Effect.gen(function* () {
   }),
 );
 
+export const runServerEnvironmentValidation = Effect.asVoid(validateServerEnvironmentOrUserError);
+
 export const runValidateConfig = Effect.gen(function* () {
-  yield* runServerEnvironmentValidation;
+  const rows = yield* validateServerEnvironmentOrUserError;
+  yield* Console.log(formatEnvValidationTable(rows, "succeeded"));
   yield* Console.log("Environment validation completed without starting the server.");
 });
