@@ -287,16 +287,22 @@ const resourceMonitorPathConfig = Config.String("T3CODE_RESOURCE_MONITOR_PATH").
   }),
 );
 
+// Trace file location, shared by the server and `t3 trace summary`.
+export const traceFileConfig = Config.String("T3CODE_TRACE_FILE").pipe(
+  Config.option,
+  Config.map(Option.getOrUndefined),
+);
+export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
+  Config.withDefault(10),
+);
+
 export const serverEnvironmentConfig = {
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
-  traceFile: Config.String("T3CODE_TRACE_FILE").pipe(
-    Config.option,
-    Config.map(Option.getOrUndefined),
-  ),
+  traceFile: traceFileConfig,
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
-  traceMaxFiles: Config.Int("T3CODE_TRACE_MAX_FILES").pipe(Config.withDefault(10)),
+  traceMaxFiles: traceMaxFilesConfig,
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
   otlpTracesUrl: Config.schema(ValidUrlStringFromString, "T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
@@ -313,7 +319,6 @@ export const serverEnvironmentConfig = {
   otlpExportIntervalMs: Config.Int("T3CODE_OTLP_EXPORT_INTERVAL_MS").pipe(
     Config.withDefault(10_000),
   ),
-  otlpServiceName: Config.String("T3CODE_OTLP_SERVICE_NAME").pipe(Config.withDefault("t3-server")),
   otlpHeaders: Config.schema(OtlpHeadersFromString, "T3CODE_OTLP_HEADERS").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -513,13 +518,6 @@ export const serverEnvSpecs: ReadonlyArray<ServerEnvVarSpec> = [
     "OTLP export interval.",
     serverEnvironmentConfig.otlpExportIntervalMs,
     { defaultText: "10000" },
-  ),
-  envSpec(
-    "T3CODE_OTLP_SERVICE_NAME",
-    "string",
-    "Service name attached to OTLP resources.",
-    serverEnvironmentConfig.otlpServiceName,
-    { defaultText: "t3-server" },
   ),
   envSpec(
     "T3CODE_OTLP_HEADERS",
@@ -986,6 +984,27 @@ export const resolveServerConfig = (
       headers: env.otlpHeaders,
       exportIntervalMs: env.otlpExportIntervalMs,
     };
+    const traces = OtelEnvironment.resolveSignalEndpoint(
+      otel,
+      "traces",
+      { url: env.otlpTracesUrl, export: signalExport },
+      bootstrap?.otlpTracesUrl,
+      persistedObservabilitySettings.otlpTracesUrl,
+    );
+    const metrics = OtelEnvironment.resolveSignalEndpoint(
+      otel,
+      "metrics",
+      { url: env.otlpMetricsUrl, export: signalExport },
+      bootstrap?.otlpMetricsUrl,
+      persistedObservabilitySettings.otlpMetricsUrl,
+    );
+    const logs = OtelEnvironment.resolveSignalEndpoint(
+      otel,
+      "logs",
+      { url: env.otlpLogsUrl, export: signalExport },
+      bootstrap?.otlpLogsUrl,
+      persistedObservabilitySettings.otlpLogsUrl,
+    );
 
     const config: ServerConfig.ServerConfig["Service"] = {
       logLevel,
@@ -994,23 +1013,12 @@ export const resolveServerConfig = (
       traceBatchWindowMs: env.traceBatchWindowMs,
       traceMaxBytes: env.traceMaxBytes,
       traceMaxFiles: env.traceMaxFiles,
-      otlpTracesUrl: otel.disabled
-        ? undefined
-        : (env.otlpTracesUrl ??
-          bootstrap?.otlpTracesUrl ??
-          persistedObservabilitySettings.otlpTracesUrl),
-      otlpMetricsUrl: otel.disabled
-        ? undefined
-        : (env.otlpMetricsUrl ??
-          bootstrap?.otlpMetricsUrl ??
-          persistedObservabilitySettings.otlpMetricsUrl),
-      otlpLogsUrl: otel.disabled
-        ? undefined
-        : (env.otlpLogsUrl ?? bootstrap?.otlpLogsUrl ?? persistedObservabilitySettings.otlpLogsUrl),
-      otlpTracesExport: signalExport,
-      otlpMetricsExport: signalExport,
-      otlpLogsExport: signalExport,
-      otlpServiceName: env.otlpServiceName,
+      otlpTracesUrl: traces?.url,
+      otlpMetricsUrl: metrics?.url,
+      otlpLogsUrl: logs?.url,
+      otlpTracesExport: traces?.export ?? signalExport,
+      otlpMetricsExport: metrics?.export ?? signalExport,
+      otlpLogsExport: logs?.export ?? signalExport,
       otelEnvironment: otel,
       mode,
       port,
